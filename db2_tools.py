@@ -13,6 +13,10 @@ class CommandRunError(Exception):
     pass
 
 
+class SQLError(Exception):
+    pass
+
+
 class FileExistsError(Exception):
     pass
 
@@ -21,9 +25,8 @@ class FileNotExistsError(Exception):
     pass
 
 
-# 设置与shell交互窗口,默认超时时间为2分钟
-def command_run(command, timeout=30):
-    proc = subprocess.Popen(command, bufsize=0, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+def command_run(command, timeout=5):
+    proc = subprocess.Popen(command, bufsize=40960, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
     poll_seconds = .250
     deadline = time.time() + timeout
     while time.time() < deadline and proc.poll() is None:
@@ -32,6 +35,7 @@ def command_run(command, timeout=30):
         if float(sys.version[:3]) >= 2.6:
             proc.terminate()
     stdout, stderr = proc.communicate()
+    print stdout
     return str(stdout) + str(stderr), proc.returncode
 
 
@@ -166,11 +170,79 @@ class MountPoints(object):
         return MountPoint()
 
 
-if __name__ == "__main__":
-    print get_database()
-    licm = Db2licm()
-    print licm.Version
-    mp = MountPoints()
-    print mp.mountpoints[0].MPoint
-    print mp.get_mount_poin_info("/test/sdfa/tf").MPoint
+class Db2Info(object):
+    def __init__(self, dbname):
+        self.dbname = dbname
+        self.__connect()
 
+    def __connect(self):
+        stdout, recode = command_run("db2 connect to %s" % self.dbname)
+        if recode != 0:
+            raise CommandRunError("Cannot connect to %s,msg:%s" % (self.dbname, stdout))
+
+    # 返回执行结果列表
+    def __command(self, sql):
+        lines = os.popen("db2 -ec -s -x +p \"%s\"" % sql).readlines()
+        lines = map(lambda x: str(x).strip(), lines)
+        recode = int(lines[-1])
+        result = lines[:-1]
+        if recode < 0:
+            raise SQLError(result)
+        return result
+
+    # 查询当前时间戳
+    def get_current_timestamp(self):
+        return self.__command("values current timestamp")[0].strip()
+
+    # 返回数据库参数字典
+    def get_db_cfg(self):
+        class dbcfg:
+            name = ""
+            value = ""  # 内存中值
+            value_flags = ""  # NONE AUTOMATIC
+            isint = False
+        dbcfg_dict = {}
+        lines = self.__command("select name,value,value_flags,datatype from TABLE(SYSPROC.DB_GET_CFG(-1)) with ur")
+        for line in lines:
+            fields = line.split()
+            if len(fields) != 4:
+                continue
+            cfg = dbcfg()
+            cfg.name, cfg.value, cfg.value_flags, datatype = fields
+            if datatype in ['INTEGER', 'BIGINT']:
+                cfg.isint = True
+
+            dbcfg_dict[cfg.name] = cfg
+        return dbcfg_dict
+
+    # 返回实例参数字典
+    def get_dbm_cfg(self):
+        class dbmcfg:
+            name = ""
+            value = ""  # 内存中值
+            value_flags = ""  # NONE AUTOMATIC
+            isint = False
+        dbmcfg_dict = {}
+        lines = self.__command("select name,value,value_flags,datatype from TABLE(SYSPROC.DB_GET_CFG(-1)) with ur")
+        for line in lines:
+            fields = line.split()
+            if len(fields) != 4:
+                continue
+            cfg = dbmcfg()
+            cfg.name, cfg.value, cfg.value_flags, datatype = fields
+            if datatype in ['INTEGER', 'BIGINT']:
+                cfg.isint = True
+
+            dbmcfg_dict[cfg.name] = cfg
+        return dbmcfg_dict
+
+
+if __name__ == "__main__":
+    try:
+        dbinfo = Db2Info("sample")
+        print dbinfo.get_current_timestamp()
+        print dbinfo.get_db_cfg()["APPLHEAPSZ".lower()].value, dbinfo.get_db_cfg()["APPLHEAPSZ".lower()].value_flags
+    except CommandRunError, e:
+        print e
+    finally:
+        print("Done")
