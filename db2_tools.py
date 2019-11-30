@@ -35,7 +35,6 @@ def command_run(command, timeout=5):
         if float(sys.version[:3]) >= 2.6:
             proc.terminate()
     stdout, stderr = proc.communicate()
-    print stdout
     return str(stdout) + str(stderr), proc.returncode
 
 
@@ -170,29 +169,29 @@ class MountPoints(object):
         return MountPoint()
 
 
+def run_sql(sql):
+    lines = os.popen("db2 -ec -s -x +p \"%s\"" % sql).readlines()
+    lines = map(lambda x: str(x).strip(), lines)
+    recode = int(lines[-1])
+    result = lines[:-1]
+    if recode < 0:
+        raise SQLError(result)
+    return result
+
+
 class Db2Info(object):
     def __init__(self, dbname):
-        self.dbname = dbname
+        self._dbname = dbname
         self.__connect()
 
     def __connect(self):
-        stdout, recode = command_run("db2 connect to %s" % self.dbname)
+        stdout, recode = command_run("db2 connect to %s" % self._dbname)
         if recode != 0:
-            raise CommandRunError("Cannot connect to %s,msg:%s" % (self.dbname, stdout))
-
-    # 返回执行结果列表
-    def __command(self, sql):
-        lines = os.popen("db2 -ec -s -x +p \"%s\"" % sql).readlines()
-        lines = map(lambda x: str(x).strip(), lines)
-        recode = int(lines[-1])
-        result = lines[:-1]
-        if recode < 0:
-            raise SQLError(result)
-        return result
+            raise CommandRunError("Cannot connect to %s,msg:%s" % (self._dbname, stdout))
 
     # 查询当前时间戳
     def get_current_timestamp(self):
-        return self.__command("values current timestamp")[0].strip()
+        return run_sql("values current timestamp")[0].strip()
 
     # 返回数据库参数字典
     def get_db_cfg(self):
@@ -202,7 +201,7 @@ class Db2Info(object):
             value_flags = ""  # NONE AUTOMATIC
             isint = False
         dbcfg_dict = {}
-        lines = self.__command("select name,value,value_flags,datatype from TABLE(SYSPROC.DB_GET_CFG(-1)) with ur")
+        lines = run_sql("select name,value,value_flags,datatype from TABLE(SYSPROC.DB_GET_CFG(-1)) with ur")
         for line in lines:
             fields = line.split()
             if len(fields) != 4:
@@ -223,7 +222,7 @@ class Db2Info(object):
             value_flags = ""  # NONE AUTOMATIC
             isint = False
         dbmcfg_dict = {}
-        lines = self.__command("select name,value,value_flags,datatype from TABLE(SYSPROC.DB_GET_CFG(-1)) with ur")
+        lines = run_sql("select name,value,value_flags,datatype from TABLE(SYSPROC.DB_GET_CFG(-1)) with ur")
         for line in lines:
             fields = line.split()
             if len(fields) != 4:
@@ -237,11 +236,93 @@ class Db2Info(object):
         return dbmcfg_dict
 
 
+class MonGetPkgCacheStmt(Db2Info):
+    # 除了字段名其它要以下划线开头,字段中不能有空格和换行符,不可以有stmt_text
+    def __init__(self):
+        self.EXECUTABLE_ID = None
+        self.NUM_EXEC_WITH_METRICS = None
+        self.TOTAL_ACT_TIME = None
+        self.TOTAL_ACT_WAIT_TIME = None
+        self.TOTAL_CPU_TIME = None
+        self.POOL_READ_TIME = None
+        self.POOL_WRITE_TIME = None
+        self.PLANID = None
+        self.STMTID = None
+        self.SEMANTIC_ENV_ID = None
+
+    # 获取综合查询SQL语句
+    def __get_sql_order_by_unions(self, n):
+        cols = ",".join(self.__get_cols())
+        sql = '''select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by NUM_EXEC_WITH_METRICS desc fetch first %d rows only with ur) a
+                    union 
+                  select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by TOTAL_ACT_TIME desc fetch first %d rows only with ur) b
+                    union
+                  select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by TOTAL_CPU_TIME desc fetch first %d rows only with ur) c
+                    union
+                  select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by ROWS_READ desc fetch first %d rows only  with ur) d''' % \
+            (cols, n, cols, n, cols, n, cols, n)
+        return sql
+
+    # 获取执行次数最多的topSQL
+    def __get_sql_order_by_executions(self, n):
+        cols = ",".join(self.__get_cols())
+        sql = "select %s from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by NUM_EXEC_WITH_METRICS desc fetch first %d rows only with ur " % (cols, n)
+        return sql
+
+    # 获取执行时间最多的topSQL
+    def __get_sql_order_by_act_time(self, n):
+        cols = ",".join(self.__get_cols())
+        sql = "select %s from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by TOTAL_ACT_TIME desc fetch first %d rows only with ur " % (cols, n)
+        return sql
+
+    # 获取字段
+    def __get_cols(self):
+        return sorted([i for i in self.__dict__ if not i.startswith("_")])
+
+    # 获取查询结果集
+    def __get_result(self, sql):
+        m_list = []
+        lines = run_sql(sql)
+        for line in lines:
+            tmp = MonGetPkgCacheStmt()
+            fields = line.split()
+            cols = tmp.__get_cols()
+            if len(fields) != len(tmp.__get_cols()):
+                continue
+            for i in xrange(len(cols)):
+                if isinstance(fields[i], float):
+                    setattr(tmp, cols[i], float(fields[i]))
+                elif isinstance(fields[i], int):
+                    setattr(tmp, cols[i], int(fields[i]))
+                else:
+                    setattr(tmp, cols[i], fields[i])
+            m_list.append(tmp)
+        return m_list
+
+    # 结合STMTID、SEMANTIC_ENV_ID来定位SQL
+    def get_top_stmt_dict_by_stmt_id(self, n=1000):
+        stmt_dict = {}
+        for m in self.__get_result(self.__get_sql_order_by_unions(n)):
+            stmt_dict[(m.STMTID, m.SEMANTIC_ENV_ID)] = m
+        return stmt_dict
+
+    # 获取执行次数最多的TOPSQL语句
+    def get_top_stmt_list_by_exections(self, n=1000):
+        return self.__get_result(self.__get_sql_order_by_executions(n))
+
+    # 获取执行时间最长的TOPSQL语句
+    def get_top_stmt_list_by_actime(self,n=1000):
+        return self.__get_result(self.__get_sql_order_by_act_time(n))
+
+
 if __name__ == "__main__":
     try:
-        dbinfo = Db2Info("sample")
-        print dbinfo.get_current_timestamp()
-        print dbinfo.get_db_cfg()["APPLHEAPSZ".lower()].value, dbinfo.get_db_cfg()["APPLHEAPSZ".lower()].value_flags
+        Db2Info("sample")
+        m = MonGetPkgCacheStmt()
+        for l in m.get_top_stmt_dict_by_stmt_id().values():
+            print l.STMTID, l.EXECUTABLE_ID, l.NUM_EXEC_WITH_METRICS
+        for l1 in m.get_top_stmt_list_by_exections():
+            print l1.EXECUTABLE_ID, l1.NUM_EXEC_WITH_METRICS
     except CommandRunError, e:
         print e
     finally:
