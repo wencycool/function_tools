@@ -2,5 +2,7 @@
 # coding=utf8
 
 name = "asdf   asf df f    d"
-import re
-print re.split("\s+", name,2)
+a=10
+print isinstance(a, int)
+
+name.count(".") <= 0 and name.replace(".", "").isdigit()

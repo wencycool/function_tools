@@ -236,51 +236,70 @@ class Db2Info(object):
         return dbmcfg_dict
 
 
-class MonGetPkgCacheStmt(Db2Info):
+class MonGetPkgCacheStmt(object):
     # 除了字段名其它要以下划线开头,字段中不能有空格和换行符,不可以有stmt_text
     def __init__(self):
-        self.EXECUTABLE_ID = None
-        self.NUM_EXEC_WITH_METRICS = None
-        self.TOTAL_ACT_TIME = None
-        self.TOTAL_ACT_WAIT_TIME = None
-        self.TOTAL_CPU_TIME = None
-        self.POOL_READ_TIME = None
-        self.POOL_WRITE_TIME = None
-        self.PLANID = None
-        self.STMTID = None
-        self.SEMANTIC_ENV_ID = None
+        self.EXECUTABLE_ID = ""
+        self.NUM_EXEC_WITH_METRICS = 0
+        self.TOTAL_ACT_TIME = 0
+        self.TOTAL_ACT_WAIT_TIME = 0
+        self.TOTAL_CPU_TIME = 0
+        self.POOL_READ_TIME = 0
+        self.POOL_WRITE_TIME = 0
+        self.LOCK_WAIT_TIME = 0
+        self.ROWS_MODIFIED = 0
+        self.ROWS_READ = 0
+        self.ROWS_RETURNED = 0
+        self.POOL_DATA_L_READS = 0
+        self.POOL_INDEX_L_READS = 0
+        self.POOL_TEMP_DATA_L_READS = 0
+        self.POOL_DATA_P_READS = 0
+        self.POOL_INDEX_P_READS = 0
+        self.POOL_TEMP_DATA_P_READS = 0
+        self.TOTAL_SORTS = 0
+        self.ROWS_DELETED = 0
+        self.ROWS_INSERTED = 0
+        self.ROWS_UPDATED = 0
+        self.PLANID = -1
+        self.STMTID = -1
+        self.SEMANTIC_ENV_ID = -1
+        self.__cols = []  # 定义存放字段的列表
+        self.__no_delta_list = ['SECTION_TYPE', 'SECTION_NUMBER', 'SEMANTIC_ENV_ID', 'STMTID', 'PLANID']  # 定义不应该做delta的int类型的字段
 
     # 获取综合查询SQL语句
     def __get_sql_order_by_unions(self, n):
         cols = ",".join(self.__get_cols())
-        sql = '''select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by NUM_EXEC_WITH_METRICS desc fetch first %d rows only with ur) a
+        sql = '''select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t where NUM_EXEC_WITH_METRICS != 0  order by NUM_EXEC_WITH_METRICS desc fetch first %d rows only with ur) a
                     union 
-                  select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by TOTAL_ACT_TIME desc fetch first %d rows only with ur) b
+                  select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t where NUM_EXEC_WITH_METRICS != 0 order by TOTAL_ACT_TIME desc fetch first %d rows only with ur) b
                     union
-                  select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by TOTAL_CPU_TIME desc fetch first %d rows only with ur) c
+                  select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t where NUM_EXEC_WITH_METRICS != 0 order by TOTAL_CPU_TIME desc fetch first %d rows only with ur) c
                     union
-                  select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by ROWS_READ desc fetch first %d rows only  with ur) d''' % \
+                  select %s from (select * from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t where NUM_EXEC_WITH_METRICS != 0 order by ROWS_READ desc fetch first %d rows only  with ur) d''' % \
             (cols, n, cols, n, cols, n, cols, n)
         return sql
 
     # 获取执行次数最多的topSQL
     def __get_sql_order_by_executions(self, n):
         cols = ",".join(self.__get_cols())
-        sql = "select %s from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by NUM_EXEC_WITH_METRICS desc fetch first %d rows only with ur " % (cols, n)
+        sql = "select %s from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t where NUM_EXEC_WITH_METRICS != 0 order by NUM_EXEC_WITH_METRICS desc fetch first %d rows only with ur " % (cols, n)
         return sql
 
     # 获取执行时间最多的topSQL
     def __get_sql_order_by_act_time(self, n):
         cols = ",".join(self.__get_cols())
-        sql = "select %s from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t order by TOTAL_ACT_TIME desc fetch first %d rows only with ur " % (cols, n)
+        sql = "select %s from table(mon_get_pkg_cache_stmt(null,null,null,null)) as t where NUM_EXEC_WITH_METRICS != 0 order by TOTAL_ACT_TIME desc fetch first %d rows only with ur " % (cols, n)
         return sql
 
     # 获取字段
     def __get_cols(self):
-        return sorted([i for i in self.__dict__ if not i.startswith("_")])
+        if len(self.__cols) == 0:
+            return sorted([i for i in self.__dict__ if not i.startswith("_")])
+        else:
+            return self.__cols
 
     # 获取查询结果集
-    def __get_result(self, sql):
+    def __get_result_raw(self, sql):
         m_list = []
         lines = run_sql(sql)
         for line in lines:
@@ -290,39 +309,116 @@ class MonGetPkgCacheStmt(Db2Info):
             if len(fields) != len(tmp.__get_cols()):
                 continue
             for i in xrange(len(cols)):
-                if isinstance(fields[i], float):
-                    setattr(tmp, cols[i], float(fields[i]))
-                elif isinstance(fields[i], int):
+                if fields[i].isdigit():
                     setattr(tmp, cols[i], int(fields[i]))
+                elif fields[i].count(".") == 1 and fields[1].replace(".", "").isdigit():
+                    setattr(tmp, cols[i], float(fields[i]))
                 else:
                     setattr(tmp, cols[i], fields[i])
             m_list.append(tmp)
         return m_list
 
+    # 对查询结果集按照 SEMANTIC_ENV_ID、STMTID进行聚合,得出列表
+    def __get_result(self, sql):
+        m_dict = {}
+        for m in self.__get_result_raw(sql):
+            key = (m.STMTID, m.SEMANTIC_ENV_ID)
+            if key in m_dict:
+                #进行累加
+                cols = m_dict[key].__get_cols()
+                for col in cols:
+                    v = getattr(m_dict[key], col)
+                    # 过滤掉一些int类型的常量指标PLANID,STMTID,SEMANTIC_ENV_ID
+                    if col not in self.__no_delta_list and (isinstance(v, int) or isinstance(v, float)):
+                        setattr(m_dict[key], col, v + getattr(m, col))
+            else:
+                m_dict[key] = m
+        return m_dict.values()
     # 结合STMTID、SEMANTIC_ENV_ID来定位SQL
-    def get_top_stmt_dict_by_stmt_id(self, n=1000):
+    def get_top_stmt_dict_by_union(self, n=1000):
         stmt_dict = {}
         for m in self.__get_result(self.__get_sql_order_by_unions(n)):
             stmt_dict[(m.STMTID, m.SEMANTIC_ENV_ID)] = m
         return stmt_dict
 
     # 获取执行次数最多的TOPSQL语句
-    def get_top_stmt_list_by_exections(self, n=1000):
-        return self.__get_result(self.__get_sql_order_by_executions(n))
+    def get_top_stmt_dict_by_exections(self, n=1000):
+        stmt_dict = {}
+        for m in self.__get_result(self.__get_sql_order_by_executions(n)):
+            stmt_dict[(m.STMTID, m.SEMANTIC_ENV_ID)] = m
+        return stmt_dict
 
     # 获取执行时间最长的TOPSQL语句
-    def get_top_stmt_list_by_actime(self,n=1000):
-        return self.__get_result(self.__get_sql_order_by_act_time(n))
+    def get_top_stmt_dict_by_actime(self, n=1000):
+        stmt_dict = {}
+        for m in self.__get_result(self.__get_sql_order_by_act_time(n)):
+            stmt_dict[(m.STMTID, m.SEMANTIC_ENV_ID)] = m
+        return stmt_dict
 
+    # 获取时间间隔内的执行次数最多的TOPSQL语句
+    def get_top_stmt_dict_by_exections_delta(self, topN=1000, delta_s=10):
+        return self.__get_top_stmt_dict_by_x_delta(self.get_top_stmt_dict_by_exections, topN, delta_s)
+
+    # 获取时间间隔内的综合TOP的SQL语句
+    def get_top_stmt_dict_by_union_delta(self, topN=1000, delta_s=10):
+        return self.__get_top_stmt_dict_by_x_delta(self.get_top_stmt_dict_by_union, topN, delta_s)
+
+    # 获取时间间隔内耗时最多的TOPSQL语句
+    def get_top_stmt_dict_by_actime_delta(self, topN=1000, delta_s=10):
+        return self.__get_top_stmt_dict_by_x_delta(self.get_top_stmt_dict_by_actime, topN, delta_s)
+
+    # 获取时间间隔内的TOPSQL语句
+    def __get_top_stmt_dict_by_x_delta(self, x_func, topN=1000, delta_s=10):
+        dict_before = x_func(topN)
+        time.sleep(delta_s)
+        dict_after = x_func(topN)
+        diff_dict = {}
+        # 做差值对比，只保留after中存在或者共同存在的
+        for key in dict_after:
+            if key in dict_before:
+                tmp = MonGetPkgCacheStmt()
+                cols = tmp.__get_cols()
+                for col in cols:
+                    before_v = getattr(dict_before[key], col)
+                    after_v = getattr(dict_after[key], col)
+                    # 过滤掉一些int类型的常量指标PLANID,STMTID,SEMANTIC_ENV_ID
+                    if col not in self.__no_delta_list and (isinstance(after_v, int) or isinstance(after_v, float)):
+                        setattr(tmp, col, after_v - before_v)
+                    else:
+                        setattr(tmp, col, after_v)
+                if tmp.NUM_EXEC_WITH_METRICS != 0:
+                    diff_dict[key] = tmp
+            else:
+                diff_dict[key] = dict_after[key]
+        return diff_dict
+
+    # 求平均值
+    def get_avg_by_x(self, pkg_cache_dict):
+        result_dict = {}
+        for k, mon_obj in pkg_cache_dict.items():
+            if mon_obj.NUM_EXEC_WITH_METRICS == 0:
+                continue
+            tmp = MonGetPkgCacheStmt()
+            cols = tmp.__get_cols()
+            for col in cols:
+                v = getattr(mon_obj, col)
+                # 过滤掉一些int类型的常量指标PLANID,STMTID,SEMANTIC_ENV_ID
+                if col not in self.__no_delta_list and col != "NUM_EXEC_WITH_METRICS" and (isinstance(v, int) or isinstance(v, float)):
+                    setattr(tmp, col, v / mon_obj.NUM_EXEC_WITH_METRICS)
+                else:
+                    setattr(tmp, col, v)
+            result_dict[k] = tmp
+        return result_dict
 
 if __name__ == "__main__":
     try:
         Db2Info("sample")
         m = MonGetPkgCacheStmt()
-        for l in m.get_top_stmt_dict_by_stmt_id().values():
-            print l.STMTID, l.EXECUTABLE_ID, l.NUM_EXEC_WITH_METRICS
-        for l1 in m.get_top_stmt_list_by_exections():
-            print l1.EXECUTABLE_ID, l1.NUM_EXEC_WITH_METRICS
+        pkg_cache_dict = m.get_top_stmt_dict_by_exections_delta(topN=100, delta_s=2)
+        v = m.get_avg_by_x(pkg_cache_dict).values()
+        for avg in sorted(v, key=lambda x: x.NUM_EXEC_WITH_METRICS, reverse=True):
+            print avg.NUM_EXEC_WITH_METRICS, avg.PLANID, avg.STMTID,avg.EXECUTABLE_ID, avg.ROWS_READ, avg.POOL_DATA_L_READS, avg.POOL_DATA_L_READS, avg.POOL_INDEX_L_READS
+
     except CommandRunError, e:
         print e
     finally:
